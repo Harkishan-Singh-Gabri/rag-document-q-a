@@ -1,9 +1,13 @@
 import os
 import shutil
+import logging
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app.rag_pipeline import RAGPipeline
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="RAG Document Q&A API",
@@ -11,7 +15,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Allow Streamlit frontend to call this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,8 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global pipeline instance
-# In production you'd use session-based or user-based instances
 pipeline = RAGPipeline(
     chunk_size=500,
     chunk_overlap=50,
@@ -30,8 +31,11 @@ pipeline = RAGPipeline(
 UPLOAD_DIR = "data/uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+MAX_FILE_SIZE_MB = 20
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
-# ── Request/Response Models ──────────────────────────────────────────────────
+
+# Request/Response Models 
 
 class QueryRequest(BaseModel):
     question: str
@@ -40,11 +44,11 @@ class QueryResponse(BaseModel):
     answer: str
     sources: list
     scores: list
-    tokens_used: int
+    tokens_used: int = 0
     response_time_seconds: float
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# Endpoints 
 
 @app.get("/")
 def root():
@@ -67,19 +71,31 @@ async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    # Save uploaded file
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    # Sanitize filename to prevent path traversal (e.g. "../../etc/passwd").
+    safe_filename = os.path.basename(file.filename)
+    file_path = os.path.join(UPLOAD_DIR, safe_filename)
 
-    # Ingest into pipeline
+    size = 0
+    with open(file_path, "wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_FILE_SIZE_BYTES:
+                f.close()
+                os.remove(file_path)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File exceeds {MAX_FILE_SIZE_MB}MB limit."
+                )
+            f.write(chunk)
+
     try:
         stats = pipeline.ingest(file_path)
-        return {
-            "message": "Document ingested successfully.",
-            "stats": stats
-        }
+        return {"message": "Document ingested successfully.", "stats": stats}
+    except ValueError as e:
+        # Raised by chunking.py for scanned PDFs / empty extraction / no chunks
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
+        logger.exception("Ingestion failed")
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
 
@@ -91,6 +107,10 @@ def ask_question(request: QueryRequest):
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     result = pipeline.query(request.question)
+
+    # Distinguish a genuine LLM/backend failure from a normal "no answer" response.
+    if result.get("error") and result.get("answer") is None:
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {result['error']}")
 
     return QueryResponse(
         answer=result["answer"],

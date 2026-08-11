@@ -2,20 +2,31 @@ import fitz  # PyMuPDF
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from typing import List
 
+MIN_EXTRACTED_CHARS = 200  # below this, likely a scanned/image-only PDF
+
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """
     Extract raw text from a PDF file using PyMuPDF.
-    Handles multi-page PDFs and preserves paragraph structure.
+    Handles multi-page PDFs. Page boundaries are NOT embedded as inline
+    markers (that would pollute chunk embeddings) — pages are joined with
+    a plain newline instead.
     """
     doc = fitz.open(pdf_path)
-    full_text = ""
+    pages = []
 
-    for page_num, page in enumerate(doc):
-        text = page.get_text("text")  # plain text extraction
-        full_text += f"\n--- Page {page_num + 1} ---\n{text}"
+    for page in doc:
+        pages.append(page.get_text("text"))
 
     doc.close()
+    full_text = "\n".join(pages)
+
+    if len(full_text.strip()) < MIN_EXTRACTED_CHARS:
+        raise ValueError(
+            "Extracted almost no text from this PDF. It may be a scanned/"
+            "image-only document — OCR is not supported by this pipeline."
+        )
+
     return full_text
 
 
@@ -45,6 +56,10 @@ def chunk_text(
 
     # Filter out very short chunks (usually noise)
     chunks = [c.strip() for c in chunks if len(c.strip()) > 50]
+
+    if not chunks:
+        raise ValueError("No usable chunks produced from this document.")
+
     return chunks
 
 

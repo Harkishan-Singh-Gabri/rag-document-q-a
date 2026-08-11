@@ -5,8 +5,6 @@ import os
 from typing import List, Tuple
 from sentence_transformers import SentenceTransformer
 
-# Using a lightweight but high-quality model
-# all-MiniLM-L6-v2: 80MB, fast, good quality for semantic search
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 # Singleton pattern — load model once, reuse
